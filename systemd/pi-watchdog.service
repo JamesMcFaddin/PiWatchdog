@@ -1,0 +1,6 @@
+[Unit]
+Description=Process Watchdog Service for AdProcess
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/astepup/PiWatchdog/PiWatchdog.py
