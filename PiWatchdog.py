@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+import json
 import subprocess
 import time
 
@@ -16,22 +18,32 @@ import time
 # Path setup
 # -----------------------------------------------------------------------------
 
-# Resolve the absolute directory of the running script
-# And use its parent as HOME_DIR
-SCRIPT_DIR = Path(__file__).resolve().parent
-HOME_DIR = SCRIPT_DIR.parent
-FLAGS_DIR = HOME_DIR / "flags"
-DEBUG_FLAG = FLAGS_DIR / "debug"
+def _get_ram_base() -> Path:
+    try:
+        ram = Path("/dev/shm")
+        if ram.exists() and ram.is_dir():
+            return ram
+    except Exception:
+        pass
 
-# Hardcoded for now
+    return Path("/tmp")
+
+
+SCRIPT_DIR: Path = Path(__file__).resolve().parent
+HOME_DIR: Path = SCRIPT_DIR.parent
+
+RAM_BASE: Path = _get_ram_base()
+RUNTIME_DIR: Path = RAM_BASE / "AdProcess"
+FLAGS_DIR: Path = RUNTIME_DIR / "Flags"
+
+DEBUG_FLAG: Path = FLAGS_DIR / "debug-PiWatchdog"
+
 PROCESS_NAME = "AdProcess"
-MON_FILE = FLAGS_DIR / f"{PROCESS_NAME}.mon"
-STATE_FILE = FLAGS_DIR / f"{PROCESS_NAME}.watchdog.state"
+MON_FILE: Path = FLAGS_DIR / f"{PROCESS_NAME}.mon"
+STATE_FILE: Path = FLAGS_DIR / "PiWatchdog.state"
 
-# Process should touch every 30 seconds
-# Watchdog runs every 30 seconds
-# Reboot if heartbeat gets older than 1 hour
 STALE_SECONDS = 60 * 60  # 1 hour
+STALL_NOTICE_SECONDS = 30.0
 
 
 # -----------------------------------------------------------------------------
@@ -44,7 +56,7 @@ def debug_enabled() -> bool:
 
 def log_info(msg: str) -> None:
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} [PiProcessWatchdog] {msg}", flush=True)
+    print(f"{now} [PiWatchdog] {msg}", flush=True)
 
 
 def log_debug(msg: str) -> None:
@@ -53,38 +65,164 @@ def log_debug(msg: str) -> None:
 
 
 # -----------------------------------------------------------------------------
+# State helpers
+# -----------------------------------------------------------------------------
+
+def default_state() -> dict[str, float]:
+    return {
+        "last_mon_time": 0.0,
+        "stall_time": 0.0,
+    }
+
+
+def load_state() -> dict[str, float]:
+    if not STATE_FILE.exists():
+        return default_state()
+
+    try:
+        raw = STATE_FILE.read_text(encoding="utf-8").strip()
+
+        if not raw:
+            return default_state()
+
+        obj: Any = json.loads(raw)
+
+        if not isinstance(obj, dict):
+            return default_state()
+
+        return {
+            "last_mon_time": float(obj.get("last_mon_time", 0.0)),
+            "stall_time": float(obj.get("stall_time", 0.0)),
+        }
+
+    except Exception as e:
+        log_info(f"failed to read state file {STATE_FILE}: {e}")
+        return default_state()
+
+
+def save_state(state: dict[str, float]) -> None:
+    try:
+        FLAGS_DIR.mkdir(parents=True, exist_ok=True)
+
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(state, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        tmp.replace(STATE_FILE)
+
+    except Exception as e:
+        log_info(f"failed to write state file {STATE_FILE}: {e}")
+
+
+# -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 
-def file_age_seconds(path: Path) -> float:
+def file_mtime_seconds(path: Path) -> float:
     try:
-        return time.time() - path.stat().st_mtime
+        return float(path.stat().st_mtime)
     except Exception as e:
         log_info(f"stat failed for {path}: {e}")
-        return 999999999.0
+        return 0.0
 
 
-def mark_stale_logged() -> None:
+def format_minutes(seconds: float) -> str:
+    return f"{seconds / 60.0:.1f} minutes"
+
+
+def update_stall_state(mon_time: float, age: float) -> None:
+    """
+    Track heartbeat stalls without waiting for a full watchdog timeout.
+
+    State file fields:
+      last_mon_time:
+          Last heartbeat mtime PiWatchdog observed.
+
+      stall_time:
+          Largest observed heartbeat age during the current stall.
+
+    Logic:
+      - If heartbeat age grows beyond STALL_NOTICE_SECONDS, store the largest age.
+      - If heartbeat age later drops below the stored stall_time, AdProcess recovered.
+      - Log how long AdProcess was asleep, then clear stall_time.
+    """
+    state = load_state()
+
+    last_mon_time = state.get("last_mon_time", 0.0)
+    stall_time = state.get("stall_time", 0.0)
+
+    # First observation after boot/install/etc.
+    if last_mon_time <= 0.0:
+        state["last_mon_time"] = mon_time
+        state["stall_time"] = 0.0
+        save_state(state)
+        log_debug(f"state initialized last_mon_time={mon_time:.3f}")
+        return
+
+    # If age is growing past the notice threshold, remember the largest stall.
+    if age > STALL_NOTICE_SECONDS and age > stall_time:
+        state["stall_time"] = age
+        state["last_mon_time"] = mon_time
+        save_state(state)
+        log_debug(
+            f"{PROCESS_NAME}.mon stall observed age={age:.1f}s "
+            f"stall_time={age:.1f}s"
+        )
+        return
+
+    # If we had a stored stall and the heartbeat age is now lower,
+    # AdProcess recovered before reaching the hard timeout.
+    if stall_time > STALL_NOTICE_SECONDS and age < stall_time:
+        estimated_start = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(time.time() - stall_time),
+        )
+
+        log_info(
+            f"{PROCESS_NAME} stalled for {format_minutes(stall_time)} "
+            f"and recovered; estimated stall start: {estimated_start}"
+        )
+
+        state["stall_time"] = 0.0
+        state["last_mon_time"] = mon_time
+        save_state(state)
+        return
+
+    # Normal case: heartbeat is fresh and no stall is active.
+    if mon_time != last_mon_time:
+        state["last_mon_time"] = mon_time
+        save_state(state)
+
+
+def delete_all_mon_files() -> None:
     try:
-        STATE_FILE.touch(exist_ok=True)
+        if not FLAGS_DIR.exists():
+            log_debug(f"flags dir missing; no .mon files to delete: {FLAGS_DIR}")
+            return
+
+        mon_files = sorted(FLAGS_DIR.glob("*.mon"))
+
+        if not mon_files:
+            log_debug(f"no .mon files found in {FLAGS_DIR}")
+            return
+
+        for mon_file in mon_files:
+            try:
+                mon_file.unlink()
+                log_debug(f"deleted monitor file before reboot: {mon_file}")
+            except Exception as e:
+                log_info(f"failed to delete monitor file {mon_file}: {e}")
+
     except Exception as e:
-        log_info(f"failed to create state file {STATE_FILE}: {e}")
-
-
-def clear_stale_logged() -> None:
-    try:
-        if STATE_FILE.exists():
-            STATE_FILE.unlink()
-    except Exception as e:
-        log_info(f"failed to delete state file {STATE_FILE}: {e}")
-
-
-def stale_already_logged() -> bool:
-    return STATE_FILE.exists()
+        log_info(f"exception while deleting .mon files: {e}")
 
 
 def reboot_system(reason: str) -> int:
     log_info(f"REBOOT REQUIRED: {reason}")
+
+    delete_all_mon_files()
+
     try:
         proc = subprocess.run(
             ["/usr/bin/systemctl", "reboot"],
@@ -113,32 +251,29 @@ def reboot_system(reason: str) -> int:
 
 def main() -> int:
     log_debug(
-        f"start home_dir={HOME_DIR} flags_dir={FLAGS_DIR} "
+        f"start home_dir={HOME_DIR} runtime_dir={RUNTIME_DIR} flags_dir={FLAGS_DIR} "
         f"mon_file={MON_FILE} state_file={STATE_FILE}"
     )
 
-    # Do nothing unless the monitored process has created its .mon file.
     if not MON_FILE.exists():
         log_debug(f"monitor file missing; nothing to do: {MON_FILE}")
         return 0
 
-    age = file_age_seconds(MON_FILE)
+    mon_time = file_mtime_seconds(MON_FILE)
 
-    # Fresh heartbeat
-    if age <= STALE_SECONDS:
-        if stale_already_logged():
-            log_info(f"{PROCESS_NAME}.mon recovered age={age:.1f}s")
-            clear_stale_logged()
-        else:
-            log_debug(f"{PROCESS_NAME}.mon fresh age={age:.1f}s")
+    if mon_time <= 0.0:
+        log_info(f"unable to read monitor file time: {MON_FILE}")
         return 0
 
-    # Stale heartbeat
-    if not stale_already_logged():
-        log_info(f"{PROCESS_NAME}.mon timed out age={age:.1f}s")
-        mark_stale_logged()
-    else:
-        log_debug(f"{PROCESS_NAME}.mon still stale age={age:.1f}s")
+    age = time.time() - mon_time
+
+    update_stall_state(mon_time, age)
+
+    if age <= STALE_SECONDS:
+        log_debug(f"{PROCESS_NAME}.mon fresh age={age:.1f}s")
+        return 0
+
+    log_info(f"{PROCESS_NAME}.mon timed out age={age:.1f}s")
 
     return reboot_system(f"{PROCESS_NAME}.mon stale age={age:.1f}s")
 
