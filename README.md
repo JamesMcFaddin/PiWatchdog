@@ -12,7 +12,7 @@ If AdProcess hangs, crashes, or silently dies, reboot the Pi.
 
 It does this by watching a single file:
 
-/home/astepup/flags/AdProcess.mon
+/home/astepup/Flags/AdProcess.mon
 
 If that file stops being updated, the watchdog assumes the system is unhealthy.
 
@@ -44,7 +44,9 @@ PiWatchdog/
 
 - Script location: /home/astepup/PiWatchdog/PiWatchdog.py
 - Home directory: /home/astepup
-- Flags directory: /home/astepup/flags
+- Flags directory: /home/astepup/Flags
+
+All components derive paths the same way, so no hardcoding of usernames is required.
 
 ---
 
@@ -52,7 +54,7 @@ PiWatchdog/
 
 Watched file:
 
-/home/astepup/flags/AdProcess.mon
+/home/astepup/Flags/AdProcess.mon
 
 Behavior:
 
@@ -74,7 +76,7 @@ Behavior:
 
 AdProcess should delete:
 
-/home/astepup/flags/AdProcess.mon
+/home/astepup/Flags/AdProcess.mon
 
 on clean shutdown.
 
@@ -82,11 +84,15 @@ on clean shutdown.
 
 ## 🐞 Debug Mode
 
-Enable debug logging:
+Enable AdProcess debug logging:
 
-/home/astepup/flags/debug
+/home/astepup/Flags/debug-AdProcess
 
-Delete it to disable.
+Enable PiWatchdog debug logging:
+
+/home/astepup/Flags/debug-PiWatchdog
+
+Delete the file(s) to disable debug.
 
 ---
 
@@ -99,10 +105,24 @@ sudo ./install_pi-watchdog.sh
 
 ## 🔧 What the Installer Does
 
-- Copies PiWatchdog.py to /home/astepup/PiWatchdog
-- Creates /home/astepup/flags
-- Installs systemd service and timer
+- Resolves paths dynamically (no hardcoded user)
+- Creates /home/<user>/Flags if missing
+- Installs systemd service and timer (with placeholder replacement)
 - Enables and starts the timer
+- Safe to run multiple times (idempotent)
+
+---
+
+## 🔁 Idempotent Installer
+
+The installer can be run repeatedly without breaking anything.
+
+Each run will:
+
+- Detect INSTALL vs UPDATE mode
+- Replace systemd files safely
+- Re-enable and restart the timer
+- Leave the system in a known good state
 
 ---
 
@@ -122,7 +142,6 @@ Runs watchdog once per trigger.
 
 systemctl status pi-watchdog.timer
 systemctl list-timers | grep watchdog
-
 sudo systemctl start pi-watchdog.service
 
 ---
@@ -138,28 +157,28 @@ journalctl -u pi-watchdog.service -f
 
 Fresh test:
 
-touch /home/astepup/flags/AdProcess.mon
+touch /home/astepup/Flags/AdProcess.mon
 sudo systemctl start pi-watchdog.service
 
 Stale test:
 
-touch /home/astepup/flags/AdProcess.mon
-touch -d "2 hours ago" /home/astepup/flags/AdProcess.mon
+touch /home/astepup/Flags/AdProcess.mon
+touch -d "2 hours ago" /home/astepup/Flags/AdProcess.mon
 sudo systemctl start pi-watchdog.service
 
 Debug test:
 
-touch /home/astepup/flags/debug
+touch /home/astepup/Flags/debug-PiWatchdog
 sudo systemctl start pi-watchdog.service
 journalctl -u pi-watchdog.service -n 50
-rm -f /home/astepup/flags/debug
+rm -f /home/astepup/Flags/debug-PiWatchdog
 
 ---
 
 ## 🔄 AdProcess Responsibilities
 
 - Create the heartbeat file
-- Update it every 30 seconds
+- Update it every ~30 seconds
 - Delete it on shutdown
 
 ---
@@ -169,6 +188,20 @@ rm -f /home/astepup/flags/debug
 - Watchdog always runs once installed
 - Only acts if heartbeat file exists
 - Only reboots if file becomes stale
+
+### 🔁 Reboot Loop Protection
+
+PiWatchdog deletes all `.mon` files before rebooting.
+
+This prevents a stale heartbeat from immediately triggering another reboot after startup.
+
+---
+
+## 🧠 Control Model
+
+- WebAPI sets intent via flag files
+- AdProcess main loop performs actions
+- PiWatchdog enforces recovery if needed
 
 ---
 

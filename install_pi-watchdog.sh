@@ -3,7 +3,7 @@
 # Copyright (c) 2026 James Eddy (James McFaddin)
 # This software is licensed under the MIT License.
 # See the LICENSE file or https://opensource.org/licenses/MIT for details.
-# [install_pi-watchdog.sh] Install the PiWatchdog systemd timer/service.
+# [install_pi-watchdog.sh] Install or refresh the PiWatchdog systemd timer/service.
 
 set -u
 
@@ -13,7 +13,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOME_DIR="$(dirname "${SCRIPT_DIR}")"
-FLAGS_DIR="${HOME_DIR}/flags"
+FLAGS_DIR="${HOME_DIR}/Flags"
 
 SCRIPT_NAME="PiWatchdog.py"
 SERVICE_NAME="pi-watchdog.service"
@@ -56,44 +56,94 @@ log "HOME_DIR=${HOME_DIR}"
 log "FLAGS_DIR=${FLAGS_DIR}"
 
 # -----------------------------------------------------------------------------
+# Determine overall mode
+# -----------------------------------------------------------------------------
+
+if [[ -f "${SERVICE_DST}" || -f "${TIMER_DST}" ]]; then
+    MODE="UPDATE"
+    log "Mode: UPDATE (existing installation detected)"
+else
+    MODE="INSTALL"
+    log "Mode: INSTALL (fresh setup)"
+fi
+
+# -----------------------------------------------------------------------------
 # Ensure flags directory exists
 # -----------------------------------------------------------------------------
 
-mkdir -p "${FLAGS_DIR}" || fail "Failed to create ${FLAGS_DIR}"
+if [[ -d "${FLAGS_DIR}" ]]; then
+    log "Flags: exists (${FLAGS_DIR})"
+else
+    log "Flags: creating ${FLAGS_DIR}"
+fi
+
+install -d "${FLAGS_DIR}" || fail "Failed to create ${FLAGS_DIR}"
+
+# -----------------------------------------------------------------------------
+# Stop active units before replacing files
+# -----------------------------------------------------------------------------
+
+log "Stopping existing watchdog units (if running)..."
+systemctl stop "${TIMER_NAME}" 2>/dev/null || true
+systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 # Install systemd service (replace placeholder)
 # -----------------------------------------------------------------------------
 
-log "Installing ${SERVICE_NAME}..."
+if [[ -f "${SERVICE_DST}" ]]; then
+    log "Service: updating existing ${SERVICE_NAME}"
+else
+    log "Service: installing new ${SERVICE_NAME}"
+fi
 
-sed "s|__PIWATCHDOG_SCRIPT__|${SCRIPT_PATH}|g" "${SERVICE_TEMPLATE}" > "${SERVICE_DST}" \
-    || fail "Failed to generate ${SERVICE_DST}"
+tmp_service="$(mktemp)" || fail "Failed to create temp file"
 
-chmod 644 "${SERVICE_DST}" || fail "Failed to chmod ${SERVICE_DST}"
+sed "s|__PIWATCHDOG_SCRIPT__|${SCRIPT_PATH}|g" "${SERVICE_TEMPLATE}" > "${tmp_service}" \
+    || fail "Failed to generate service file"
+
+install -m 644 "${tmp_service}" "${SERVICE_DST}" \
+    || fail "Failed to install ${SERVICE_DST}"
+
+rm -f "${tmp_service}"
 
 # -----------------------------------------------------------------------------
 # Install timer
 # -----------------------------------------------------------------------------
 
-log "Installing ${TIMER_NAME}..."
+if [[ -f "${TIMER_DST}" ]]; then
+    log "Timer: updating existing ${TIMER_NAME}"
+else
+    log "Timer: installing new ${TIMER_NAME}"
+fi
 
-cp -f "${TIMER_SRC}" "${TIMER_DST}" \
-    || fail "Failed to copy ${TIMER_NAME}"
-
-chmod 644 "${TIMER_DST}" || fail "Failed to chmod ${TIMER_DST}"
+install -m 644 "${TIMER_SRC}" "${TIMER_DST}" \
+    || fail "Failed to install ${TIMER_DST}"
 
 # -----------------------------------------------------------------------------
-# Enable + start
+# Reload systemd
 # -----------------------------------------------------------------------------
 
-log "Reloading systemd..."
+log "Systemd: daemon-reload"
 systemctl daemon-reload || fail "daemon-reload failed"
 
-log "Enabling timer..."
-systemctl enable "${TIMER_NAME}" || fail "enable failed"
+# -----------------------------------------------------------------------------
+# Enable timer
+# -----------------------------------------------------------------------------
 
-log "Restarting timer..."
+if systemctl is-enabled "${TIMER_NAME}" >/dev/null 2>&1; then
+    log "Timer: already enabled"
+else
+    log "Timer: enabling"
+fi
+
+systemctl enable "${TIMER_NAME}" >/dev/null || fail "enable failed"
+
+# -----------------------------------------------------------------------------
+# Restart timer
+# -----------------------------------------------------------------------------
+
+log "Timer: restarting ${TIMER_NAME}"
 systemctl restart "${TIMER_NAME}" || fail "restart failed"
 
 # -----------------------------------------------------------------------------
