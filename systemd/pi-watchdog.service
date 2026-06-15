@@ -3,4 +3,6 @@ Description=Process Watchdog Service for AdProcess
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 __PIWATCHDOG_SCRIPT__
+User=astepup
+WorkingDirectory=/home/astepup
+ExecStart=/usr/bin/python3 /home/astepup/PiWatchdog/PiWatchdog.py
