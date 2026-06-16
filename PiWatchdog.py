@@ -40,8 +40,11 @@ FLAGS_DIR: Path = RUNTIME_DIR / "Flags"
 DEBUG_FLAG: Path = FLAGS_DIR / "debug-PiWatchdog"
 
 PROCESS_NAME = "AdProcess"
+PROCESS_PATTERN = "AdProcess.py"
+
 MON_FILE: Path = FLAGS_DIR / f"{PROCESS_NAME}.mon"
 STATE_FILE: Path = FLAGS_DIR / "PiWatchdog.state"
+RESTART_LOG_FILE: Path = FLAGS_DIR / f"{PROCESS_NAME}.restart.log"
 
 ADPROCESS_SCRIPT: Path = HOME_DIR / "AdProcess" / "AdProcess.py"
 
@@ -75,7 +78,7 @@ def log_debug(msg: str) -> None:
 # State helpers
 # -----------------------------------------------------------------------------
 
-def default_state() -> dict[str, Any]:
+def default_component_state() -> dict[str, Any]:
     return {
         "last_mon_time": 0.0,
         "stall_time": 0.0,
@@ -84,7 +87,41 @@ def default_state() -> dict[str, Any]:
     }
 
 
+def _normalize_component_state(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        return default_component_state()
+
+    return {
+        "last_mon_time": float(obj.get("last_mon_time", 0.0)),
+        "stall_time": float(obj.get("stall_time", 0.0)),
+        "restart_done": bool(obj.get("restart_done", False)),
+        "healthy_since": float(obj.get("healthy_since", 0.0)),
+    }
+
+
+def default_state() -> dict[str, Any]:
+    return {
+        PROCESS_NAME: default_component_state(),
+    }
+
+
 def load_state() -> dict[str, Any]:
+    """
+    Load watchdog state.
+
+    Current format is per-component:
+
+        {
+          "AdProcess": {
+            "last_mon_time": 0.0,
+            "stall_time": 0.0,
+            "restart_done": false,
+            "healthy_since": 0.0
+          }
+        }
+
+    Older flat state files are accepted and migrated in memory.
+    """
     if not STATE_FILE.exists():
         return default_state()
 
@@ -99,12 +136,22 @@ def load_state() -> dict[str, Any]:
         if not isinstance(obj, dict):
             return default_state()
 
-        return {
-            "last_mon_time": float(obj.get("last_mon_time", 0.0)),
-            "stall_time": float(obj.get("stall_time", 0.0)),
-            "restart_done": bool(obj.get("restart_done", False)),
-            "healthy_since": float(obj.get("healthy_since", 0.0)),
-        }
+        # Backward compatibility for the older flat state file.
+        if any(k in obj for k in ("last_mon_time", "stall_time", "restart_done", "healthy_since")):
+            return {
+                PROCESS_NAME: _normalize_component_state(obj),
+            }
+
+        state: dict[str, Any] = {}
+
+        for component, component_obj in obj.items():
+            if isinstance(component, str):
+                state[component] = _normalize_component_state(component_obj)
+
+        if PROCESS_NAME not in state:
+            state[PROCESS_NAME] = default_component_state()
+
+        return state
 
     except Exception as e:
         log_info(f"failed to read state file {STATE_FILE}: {e}")
@@ -124,6 +171,24 @@ def save_state(state: dict[str, Any]) -> None:
 
     except Exception as e:
         log_info(f"failed to write state file {STATE_FILE}: {e}")
+
+
+def load_component_state(component: str = PROCESS_NAME) -> dict[str, Any]:
+    state = load_state()
+    component_state = state.get(component)
+
+    if not isinstance(component_state, dict):
+        component_state = default_component_state()
+        state[component] = component_state
+        save_state(state)
+
+    return _normalize_component_state(component_state)
+
+
+def save_component_state(component_state: dict[str, Any], component: str = PROCESS_NAME) -> None:
+    state = load_state()
+    state[component] = _normalize_component_state(component_state)
+    save_state(state)
 
 
 # -----------------------------------------------------------------------------
@@ -151,7 +216,7 @@ def update_stall_state(mon_time: float, age: float, now: float) -> None:
     healthy run." It must not live forever, because a later unrelated stall
     should get its own first-strike restart before reboot escalation.
     """
-    state = load_state()
+    state = load_component_state(PROCESS_NAME)
 
     last_mon_time = float(state.get("last_mon_time", 0.0))
     stall_time = float(state.get("stall_time", 0.0))
@@ -161,17 +226,15 @@ def update_stall_state(mon_time: float, age: float, now: float) -> None:
     if last_mon_time <= 0.0:
         state["last_mon_time"] = mon_time
         state["stall_time"] = 0.0
-        save_state(state)
-        log_debug(f"state initialized last_mon_time={mon_time:.3f}")
+        save_component_state(state, PROCESS_NAME)
+        log_debug(f"state initialized component={PROCESS_NAME} last_mon_time={mon_time:.3f}")
         return
 
-    # If AdProcess has been restarted once, forgive that first strike after
-    # a sustained period of healthy heartbeats.
     if restart_done:
         if age <= HEALTHY_SECONDS:
             if healthy_since <= 0.0:
                 state["healthy_since"] = now
-                save_state(state)
+                save_component_state(state, PROCESS_NAME)
                 log_debug(
                     f"{PROCESS_NAME}.mon healthy after restart; "
                     f"healthy_since={now:.3f}"
@@ -184,7 +247,7 @@ def update_stall_state(mon_time: float, age: float, now: float) -> None:
                 state["healthy_since"] = 0.0
                 state["stall_time"] = 0.0
                 state["last_mon_time"] = mon_time
-                save_state(state)
+                save_component_state(state, PROCESS_NAME)
 
                 log_info(
                     f"restart flag cleared after {format_minutes(healthy_for)} "
@@ -194,25 +257,22 @@ def update_stall_state(mon_time: float, age: float, now: float) -> None:
         else:
             if healthy_since > 0.0:
                 state["healthy_since"] = 0.0
-                save_state(state)
+                save_component_state(state, PROCESS_NAME)
                 log_debug(
                     f"{PROCESS_NAME}.mon no longer healthy; "
                     f"clearing healthy_since age={age:.1f}s"
                 )
 
-    # If age is growing past the notice threshold, remember the largest stall.
     if age > STALL_NOTICE_SECONDS and age > stall_time:
         state["stall_time"] = age
         state["last_mon_time"] = mon_time
-        save_state(state)
+        save_component_state(state, PROCESS_NAME)
         log_debug(
             f"{PROCESS_NAME}.mon stall observed age={age:.1f}s "
             f"stall_time={age:.1f}s"
         )
         return
 
-    # If we had a stored stall and the heartbeat age is now lower,
-    # AdProcess recovered before reaching the recovery/reboot threshold.
     if stall_time > STALL_NOTICE_SECONDS and age < stall_time:
         estimated_start = time.strftime(
             "%Y-%m-%d %H:%M:%S",
@@ -226,12 +286,12 @@ def update_stall_state(mon_time: float, age: float, now: float) -> None:
 
         state["stall_time"] = 0.0
         state["last_mon_time"] = mon_time
-        save_state(state)
+        save_component_state(state, PROCESS_NAME)
         return
 
     if mon_time != last_mon_time:
         state["last_mon_time"] = mon_time
-        save_state(state)
+        save_component_state(state, PROCESS_NAME)
 
 
 def delete_all_mon_files() -> None:
@@ -285,18 +345,20 @@ def _process_exists(pattern: str) -> bool:
         return False
 
 
+def adprocess_running() -> bool:
+    return _process_exists(PROCESS_PATTERN)
+
+
 def kill_adprocess_and_vlc() -> None:
     log_info("Stopping AdProcess and VLC/cvlc...")
 
-    # Ask AdProcess politely first. If it is hung, it may not respond.
-    _run_pkill("-TERM", "AdProcess.py")
+    _run_pkill("-TERM", PROCESS_PATTERN)
     time.sleep(10)
 
-    if _process_exists("AdProcess.py"):
+    if adprocess_running():
         log_info("AdProcess did not exit after SIGTERM; forcing SIGKILL")
-        _run_pkill("-KILL", "AdProcess.py")
+        _run_pkill("-KILL", PROCESS_PATTERN)
 
-    # Kill player after AdProcess has had a chance to stop it cleanly.
     _run_pkill("-TERM", "cvlc")
     _run_pkill("-TERM", "vlc")
     time.sleep(2)
@@ -313,10 +375,8 @@ def restart_adprocess(reason: str) -> int:
       - Stop AdProcess and VLC/cvlc.
       - Remove stale monitor files.
       - Restart AdProcess.
-      - Set restart_done=true in RAM state.
-
-    If AdProcess hangs again before restart_done expires, PiWatchdog escalates
-    to a full system reboot.
+      - Capture restart stdout/stderr for later diagnosis.
+      - Set restart_done=true in per-component RAM state.
     """
     log_info(f"RESTART REQUIRED: {reason}")
 
@@ -339,23 +399,41 @@ def restart_adprocess(reason: str) -> int:
     ]
 
     try:
-        subprocess.Popen(
-            cmd,
-            cwd=str(HOME_DIR),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        FLAGS_DIR.mkdir(parents=True, exist_ok=True)
 
-        state = load_state()
+        with RESTART_LOG_FILE.open("ab") as restart_log:
+            restart_log.write(
+                f"\n===== PiWatchdog restart {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n".encode("utf-8")
+            )
+            restart_log.write(("cmd: " + " ".join(cmd) + "\n").encode("utf-8"))
+            restart_log.flush()
+
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(HOME_DIR),
+                env=env,
+                stdout=restart_log,
+                stderr=restart_log,
+                start_new_session=True,
+            )
+
+        time.sleep(2)
+
+        if proc.poll() is not None:
+            log_info(
+                f"AdProcess exited immediately after restart request "
+                f"rc={proc.returncode}; see {RESTART_LOG_FILE}"
+            )
+            return 1
+
+        state = load_component_state(PROCESS_NAME)
         state["restart_done"] = True
         state["healthy_since"] = 0.0
         state["stall_time"] = 0.0
         state["last_mon_time"] = 0.0
-        save_state(state)
+        save_component_state(state, PROCESS_NAME)
 
-        log_info("AdProcess restart requested")
+        log_info(f"AdProcess restart requested pid={proc.pid}; output={RESTART_LOG_FILE}")
         return 0
 
     except Exception as e:
@@ -365,12 +443,6 @@ def restart_adprocess(reason: str) -> int:
 
 def reboot_system(reason: str) -> int:
     log_info(f"REBOOT REQUIRED: {reason}")
-
-    state = load_state()
-    state["restart_done"] = False
-    save_state(state)
-
-    delete_all_mon_files()
 
     try:
         proc = subprocess.run(
@@ -405,8 +477,13 @@ def main() -> int:
     )
 
     if not MON_FILE.exists():
-        log_debug(f"monitor file missing; nothing to do: {MON_FILE}")
-        return 0
+        if adprocess_running():
+            log_debug(f"monitor file missing but {PROCESS_NAME} is running: {MON_FILE}")
+            return 0
+
+        return reboot_system(
+            f"{MON_FILE.name} missing and {PROCESS_NAME} process is not running"
+        )
 
     mon_time = file_mtime_seconds(MON_FILE)
 
@@ -437,7 +514,7 @@ def main() -> int:
         )
         return 0
 
-    state = load_state()
+    state = load_component_state(PROCESS_NAME)
     restart_done = bool(state.get("restart_done", False))
 
     log_info(
