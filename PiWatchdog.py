@@ -433,7 +433,7 @@ def restart_adprocess(reason: str) -> int:
         state["last_mon_time"] = 0.0
         save_component_state(state, PROCESS_NAME)
 
-        log_info(f"AdProcess restart requested pid={proc.pid}; output={RESTART_LOG_FILE}")
+        log_info(f"AdProcess restart state saved restart_done=True pid={proc.pid}; output={RESTART_LOG_FILE}")
         return 0
 
     except Exception as e:
