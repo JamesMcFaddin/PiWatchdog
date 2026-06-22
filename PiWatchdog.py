@@ -36,8 +36,11 @@ HOME_DIR: Path = SCRIPT_DIR.parent
 RAM_BASE: Path = _get_ram_base()
 RUNTIME_DIR: Path = RAM_BASE / "AdProcess"
 FLAGS_DIR: Path = RUNTIME_DIR / "Flags"
+PFLAGS_DIR: Path = HOME_DIR / "PFlags"
 
 DEBUG_FLAG: Path = FLAGS_DIR / "debug-PiWatchdog"
+PDEBUG_FLAG: Path = PFLAGS_DIR / "debug-PiWatchdog"
+PDEBUG_ALL_FLAG: Path = PFLAGS_DIR / "debug-all"
 
 PROCESS_NAME = "AdProcess"
 PROCESS_PATTERN = "AdProcess.py"
@@ -61,7 +64,11 @@ RESTART_CLEAR_HEALTHY_SECONDS = 10 * 60
 # -----------------------------------------------------------------------------
 
 def debug_enabled() -> bool:
-    return DEBUG_FLAG.exists()
+    return (
+        DEBUG_FLAG.exists()
+        or PDEBUG_FLAG.exists()
+        or PDEBUG_ALL_FLAG.exists()
+    )
 
 
 def log_info(msg: str) -> None:
@@ -83,6 +90,7 @@ def default_component_state() -> dict[str, Any]:
         "last_mon_time": 0.0,
         "stall_time": 0.0,
         "restart_done": False,
+        "restart_pending": False,
         "healthy_since": 0.0,
     }
 
@@ -95,6 +103,7 @@ def _normalize_component_state(obj: Any) -> dict[str, Any]:
         "last_mon_time": float(obj.get("last_mon_time", 0.0)),
         "stall_time": float(obj.get("stall_time", 0.0)),
         "restart_done": bool(obj.get("restart_done", False)),
+        "restart_pending": bool(obj.get("restart_pending", False)),
         "healthy_since": float(obj.get("healthy_since", 0.0)),
     }
 
@@ -369,23 +378,52 @@ def kill_adprocess_and_vlc() -> None:
         _run_pkill("-KILL", "vlc")
 
 
-def restart_adprocess(reason: str) -> int:
+def mark_restart_pending(reason: str) -> int:
     """
-    First-strike recovery:
+    Restart phase 1:
       - Stop AdProcess and VLC/cvlc.
       - Remove stale monitor files.
-      - Restart AdProcess.
-      - Capture restart stdout/stderr for later diagnosis.
-      - Set restart_done=true in per-component RAM state.
+      - Set restart_pending=true.
+      - Exit.
+
+    The next PiWatchdog timer cycle performs the actual launch. This avoids
+    starting a new AdProcess while the old one is still shutting down.
     """
-    log_info(f"RESTART REQUIRED: {reason}")
+    log_info(f"RESTART PHASE 1 REQUIRED: {reason}")
+    log_info("Restart phase 1: stopping AdProcess/VLC and waiting until next watchdog cycle to launch.")
+
+    kill_adprocess_and_vlc()
+    delete_all_mon_files()
+
+    state = load_component_state(PROCESS_NAME)
+    state["restart_pending"] = True
+    state["restart_done"] = False
+    state["healthy_since"] = 0.0
+    state["stall_time"] = 0.0
+    state["last_mon_time"] = 0.0
+    save_component_state(state, PROCESS_NAME)
+
+    log_info("Restart phase 1 complete: restart_pending=True")
+    return 0
+
+
+def launch_adprocess(reason: str) -> int:
+    """
+    Restart phase 2:
+      - Launch AdProcess after a full watchdog cycle has passed.
+      - Capture restart stdout/stderr for later diagnosis.
+      - Set restart_pending=false and restart_done=true if launch survives
+        the initial quick check.
+    """
+    log_info(f"RESTART PHASE 2 REQUIRED: {reason}")
 
     if not ADPROCESS_SCRIPT.exists():
         log_info(f"cannot restart AdProcess; missing script: {ADPROCESS_SCRIPT}")
         return 1
 
-    kill_adprocess_and_vlc()
-    delete_all_mon_files()
+    if adprocess_running():
+        log_info("Restart phase 2 postponed: AdProcess is still running.")
+        return 0
 
     uid = HOME_DIR.stat().st_uid
     env = os.environ.copy()
@@ -400,6 +438,9 @@ def restart_adprocess(reason: str) -> int:
 
     try:
         FLAGS_DIR.mkdir(parents=True, exist_ok=True)
+
+        log_info(f"Launching AdProcess: {' '.join(cmd)}")
+        log_info(f"Restart output will be written to {RESTART_LOG_FILE}")
 
         with RESTART_LOG_FILE.open("ab") as restart_log:
             restart_log.write(
@@ -417,6 +458,8 @@ def restart_adprocess(reason: str) -> int:
                 start_new_session=True,
             )
 
+        log_info(f"AdProcess launch returned pid={proc.pid}")
+
         time.sleep(2)
 
         if proc.poll() is not None:
@@ -427,19 +470,22 @@ def restart_adprocess(reason: str) -> int:
             return 1
 
         state = load_component_state(PROCESS_NAME)
+        state["restart_pending"] = False
         state["restart_done"] = True
         state["healthy_since"] = 0.0
         state["stall_time"] = 0.0
         state["last_mon_time"] = 0.0
         save_component_state(state, PROCESS_NAME)
 
-        log_info(f"AdProcess restart state saved restart_done=True pid={proc.pid}; output={RESTART_LOG_FILE}")
+        log_info(
+            f"Restart phase 2 complete: restart_pending=False "
+            f"restart_done=True pid={proc.pid}; output={RESTART_LOG_FILE}"
+        )
         return 0
 
     except Exception as e:
-        log_info(f"exception while restarting AdProcess: {e}")
+        log_info(f"exception while launching AdProcess: {e}")
         return 1
-
 
 def reboot_system(reason: str) -> int:
     log_info(f"REBOOT REQUIRED: {reason}")
@@ -472,9 +518,16 @@ def reboot_system(reason: str) -> int:
 
 def main() -> int:
     log_debug(
-        f"start home_dir={HOME_DIR} runtime_dir={RUNTIME_DIR} flags_dir={FLAGS_DIR} "
+        f"start home_dir={HOME_DIR} runtime_dir={RUNTIME_DIR} "
+        f"flags_dir={FLAGS_DIR} pflags_dir={PFLAGS_DIR} "
         f"mon_file={MON_FILE} state_file={STATE_FILE}"
     )
+
+    state = load_component_state(PROCESS_NAME)
+    restart_pending = bool(state.get("restart_pending", False))
+
+    if restart_pending:
+        return launch_adprocess("restart_pending=True from previous watchdog cycle")
 
     if not MON_FILE.exists():
         if adprocess_running():
@@ -528,7 +581,7 @@ def main() -> int:
             f"age={age:.1f}s"
         )
 
-    return restart_adprocess(f"{PROCESS_NAME}.mon stale age={age:.1f}s")
+    return mark_restart_pending(f"{PROCESS_NAME}.mon stale age={age:.1f}s")
 
 
 if __name__ == "__main__":
