@@ -5,4 +5,5 @@ Description=Process Watchdog Service for AdProcess
 Type=oneshot
 User=astepup
 WorkingDirectory=/home/astepup
+KillMode=process
 ExecStart=/usr/bin/python3 /home/astepup/PiWatchdog/PiWatchdog.py
