@@ -13,7 +13,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOME_DIR="$(dirname "${SCRIPT_DIR}")"
-FLAGS_DIR="${HOME_DIR}/flags"
+PFLAGS_DIR="${HOME_DIR}/PFlags"
 
 SCRIPT_NAME="PiWatchdog.py"
 SERVICE_NAME="pi-watchdog.service"
@@ -53,13 +53,13 @@ fi
 
 log "SCRIPT_DIR=${SCRIPT_DIR}"
 log "HOME_DIR=${HOME_DIR}"
-log "FLAGS_DIR=${FLAGS_DIR}"
+log "PFLAGS_DIR=${PFLAGS_DIR}"
 
 # -----------------------------------------------------------------------------
-# Ensure flags directory exists
+# Ensure persistent flags directory exists
 # -----------------------------------------------------------------------------
 
-mkdir -p "${FLAGS_DIR}" || fail "Failed to create ${FLAGS_DIR}"
+mkdir -p "${PFLAGS_DIR}" || fail "Failed to create ${PFLAGS_DIR}"
 
 # -----------------------------------------------------------------------------
 # Install systemd service (replace placeholder)
@@ -69,6 +69,14 @@ log "Installing ${SERVICE_NAME}..."
 
 sed "s|__PIWATCHDOG_SCRIPT__|${SCRIPT_PATH}|g" "${SERVICE_TEMPLATE}" > "${SERVICE_DST}" \
     || fail "Failed to generate ${SERVICE_DST}"
+
+# Safety net:
+# Ensure the installed oneshot service does not kill AdProcess when PiWatchdog
+# launches it and then exits.
+if ! grep -q "^KillMode=process$" "${SERVICE_DST}"; then
+    sed -i '/^\[Service\]/a KillMode=process' "${SERVICE_DST}" \
+        || fail "Failed to add KillMode=process to ${SERVICE_DST}"
+fi
 
 chmod 644 "${SERVICE_DST}" || fail "Failed to chmod ${SERVICE_DST}"
 
@@ -102,4 +110,4 @@ systemctl restart "${TIMER_NAME}" || fail "restart failed"
 
 log "Install complete."
 log "Script path: ${SCRIPT_PATH}"
-log "Flags dir: ${FLAGS_DIR}"
+log "Persistent flags dir: ${PFLAGS_DIR}"
