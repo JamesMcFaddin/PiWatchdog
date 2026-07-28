@@ -1,215 +1,194 @@
-# 🧩 PiWatchdog – AdProcess Watchdog
+# 🧩 PiWatchdog -- AdProcess Watchdog
 
-A lightweight watchdog for Raspberry Pi that monitors a heartbeat file created by AdProcess. If the heartbeat stops updating, the system automatically reboots.
+A lightweight watchdog for Raspberry Pi that monitors one or more
+heartbeat monitor files. If a monitored component hangs, PiWatchdog
+automatically attempts recovery and escalates to a reboot only when
+recovery has already failed.
 
----
+------------------------------------------------------------------------
 
 ## 🎯 Purpose
 
-PiWatchdog exists to solve one problem:
+PiWatchdog is an autonomous recovery service. Its job is to keep
+long-running components healthy without embedding watchdog logic inside
+each application.
 
-If AdProcess hangs, crashes, or silently dies, reboot the Pi.
+For each monitored component it can:
 
-It does this by watching a single file:
+-   Monitor heartbeat (`*.mon`) files.
+-   Detect stalled or hung processes.
+-   Request a restart through AdLauncher.
+-   Reboot the Pi if a restarted component fails again before proving it
+    is healthy.
 
-/home/astepup/Flags/AdProcess.mon
-
-If that file stops being updated, the watchdog assumes the system is unhealthy.
-
----
+------------------------------------------------------------------------
 
 ## ⚙️ How It Works
 
-1. AdProcess creates and updates a heartbeat file
-2. PiWatchdog checks that file every 30 seconds
-3. If the file is older than 1 hour → reboot
+1.  Components publish a monitor contract (`*.mon`).
+2.  PiWatchdog scans all monitor files every 30 seconds.
+3.  Healthy components are left alone.
+4.  Stale components are stopped and a `.launch` request is written.
+5.  AdLauncher restarts the component.
+6.  If the component fails again during its probation period, PiWatchdog
+    reboots the Pi.
 
-No file = no monitoring = no action
+------------------------------------------------------------------------
 
----
+## 📁 Runtime Layout
 
-## 📁 Directory Layout
+``` text
+/dev/shm/AdProcess/
+└── Flags/
+    ├── *.mon
+    ├── *.launch
+    ├── PiWatchdog.state
+    └── PiWatchdog.reboot
+```
 
-PiWatchdog/
-├── README.md
-├── PiWatchdog.py
-├── install_pi-watchdog.sh
-└── systemd/
-    ├── pi-watchdog.service
-    └── pi-watchdog.timer
+The runtime directory resides in RAM to minimize SD card writes.
 
----
+------------------------------------------------------------------------
 
 ## 🧠 Path Logic
 
-- Script location: /home/astepup/PiWatchdog/PiWatchdog.py
-- Home directory: /home/astepup
-- Flags directory: /home/astepup/Flags
+All paths are derived relative to the script location. No usernames or
+home directories are hard-coded.
 
-All components derive paths the same way, so no hardcoding of usernames is required.
+------------------------------------------------------------------------
 
----
+## 📌 Monitor Files
 
-## 📌 Heartbeat File
+Each `.mon` file contains a monitor contract describing:
 
-Watched file:
+-   component name
+-   stop procedure
+-   launch command
+-   recovery policy
 
-/home/astepup/Flags/AdProcess.mon
+If no `.mon` file exists, PiWatchdog takes no action.
 
-Behavior:
-
-- Exists and updating → healthy
-- Exists but stale → reboot
-- Does not exist → do nothing
-
----
+------------------------------------------------------------------------
 
 ## 🧪 Timing Rules
 
-- AdProcess updates every ~30 seconds
-- Watchdog runs every 30 seconds
-- Reboot threshold = 1 hour
+-   Watchdog cycle: every 30 seconds
+-   Healthy: ≤ 6 minutes
+-   Stall notice: \> 8 minutes
+-   Stale: \> 15 minutes
 
----
+------------------------------------------------------------------------
 
-## 🛑 Shutdown Behavior
+## 🔄 Recovery
 
-AdProcess should delete:
+On the first stale timeout:
 
-/home/astepup/Flags/AdProcess.mon
+-   Stop the component.
+-   Write a `.launch` request.
+-   Delete the stale `.mon` file.
+-   Wait for AdLauncher to restart it.
 
-on clean shutdown.
+If the component later proves healthy, the restart history is cleared.
 
----
+If it fails again before the probation period expires, PiWatchdog
+reboots the Pi.
+
+------------------------------------------------------------------------
+
+## 🔁 Reboot Strategy
+
+PiWatchdog first attempts an orderly reboot:
+
+``` bash
+sudo -n systemctl reboot
+```
+
+If still running about 15 seconds later:
+
+``` bash
+sudo -n sync
+sudo -n reboot -f
+```
+
+This guarantees recovery even if systemd hangs.
+
+------------------------------------------------------------------------
 
 ## 🐞 Debug Mode
 
-Enable AdProcess debug logging:
+Enable debug logging by creating either:
 
-/home/astepup/Flags/debug-AdProcess
+``` text
+~/PFlags/debug-PiWatchdog
+```
 
-Enable PiWatchdog debug logging:
+or
 
-/home/astepup/Flags/debug-PiWatchdog
+``` text
+~/PFlags/debug-all
+```
 
-Delete the file(s) to disable debug.
+Remove the file to return to normal logging.
 
----
+------------------------------------------------------------------------
 
-## 🚀 Installation
+## 🚀 Startup
 
-chmod +x install_pi-watchdog.sh
-sudo ./install_pi-watchdog.sh
+PiWatchdog is started automatically during login/startup alongside
+AdProcess.
 
----
+It runs continuously; no systemd timer is required.
 
-## 🔧 What the Installer Does
+------------------------------------------------------------------------
 
-- Resolves paths dynamically (no hardcoded user)
-- Creates /home/<user>/Flags if missing
-- Installs systemd service and timer (with placeholder replacement)
-- Enables and starts the timer
-- Safe to run multiple times (idempotent)
+## 📊 Logging
 
----
+Normal logging records:
 
-## 🔁 Idempotent Installer
+-   restart requests
+-   successful recoveries
+-   reboot requests
+-   errors
 
-The installer can be run repeatedly without breaking anything.
+Debug logging additionally records heartbeat timing and state
+transitions.
 
-Each run will:
+------------------------------------------------------------------------
 
-- Detect INSTALL vs UPDATE mode
-- Replace systemd files safely
-- Re-enable and restart the timer
-- Leave the system in a known good state
+## 🔄 Component Responsibilities
 
----
+Each monitored component is responsible for:
 
-## ⏱️ systemd Timer
+-   creating its `.mon` file
+-   updating its heartbeat
+-   deleting the `.mon` file during an orderly shutdown
 
-Runs every 30 seconds.
-
----
-
-## 🧩 systemd Service
-
-Runs watchdog once per trigger.
-
----
-
-## 📊 Status Commands
-
-systemctl status pi-watchdog.timer
-systemctl list-timers | grep watchdog
-sudo systemctl start pi-watchdog.service
-
----
-
-## 📜 Logs
-
-journalctl -u pi-watchdog.service -n 50
-journalctl -u pi-watchdog.service -f
-
----
-
-## 🧪 Testing
-
-Fresh test:
-
-touch /home/astepup/Flags/AdProcess.mon
-sudo systemctl start pi-watchdog.service
-
-Stale test:
-
-touch /home/astepup/Flags/AdProcess.mon
-touch -d "2 hours ago" /home/astepup/Flags/AdProcess.mon
-sudo systemctl start pi-watchdog.service
-
-Debug test:
-
-touch /home/astepup/Flags/debug-PiWatchdog
-sudo systemctl start pi-watchdog.service
-journalctl -u pi-watchdog.service -n 50
-rm -f /home/astepup/Flags/debug-PiWatchdog
-
----
-
-## 🔄 AdProcess Responsibilities
-
-- Create the heartbeat file
-- Update it every ~30 seconds
-- Delete it on shutdown
-
----
+------------------------------------------------------------------------
 
 ## ⚠️ Important Notes
 
-- Watchdog always runs once installed
-- Only acts if heartbeat file exists
-- Only reboots if file becomes stale
+-   PiWatchdog only acts on components that publish monitor contracts.
+-   Recovery is attempted before rebooting.
+-   Runtime state is stored in `PiWatchdog.state` so recovery history
+    survives watchdog restarts.
 
-### 🔁 Reboot Loop Protection
-
-PiWatchdog deletes all `.mon` files before rebooting.
-
-This prevents a stale heartbeat from immediately triggering another reboot after startup.
-
----
+------------------------------------------------------------------------
 
 ## 🧠 Control Model
 
-- WebAPI sets intent via flag files
-- AdProcess main loop performs actions
-- PiWatchdog enforces recovery if needed
+-   Components publish monitor contracts.
+-   PiWatchdog monitors health.
+-   AdLauncher performs launches.
+-   PiWatchdog escalates to reboot only after software recovery fails.
 
----
+------------------------------------------------------------------------
 
 ## ✅ Summary
 
-- One process: AdProcess
-- One heartbeat file
-- One watchdog
-- Reboot on failure
-
-Simple. Reliable.
+-   Continuous watchdog
+-   Multiple monitored components
+-   JSON monitor contracts
+-   Automatic restart through AdLauncher
+-   Probation-based recovery
+-   Graceful reboot with forced fallback
+-   RAM-based runtime files
