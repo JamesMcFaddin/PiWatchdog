@@ -49,6 +49,8 @@ STALE_SECONDS = 15 * 60
 
 DEFAULT_RESTART_CLEAR_HEALTHY_SECONDS = 10 * 60
 DEFAULT_TERM_WAIT_SECONDS = 10
+CHECK_INTERVAL_SECONDS = 30.0
+ORDERLY_REBOOT_WAIT_SECONDS = 15.0
 
 
 # -----------------------------------------------------------------------------
@@ -652,6 +654,37 @@ def update_stall_state(
 # Reboot
 # -----------------------------------------------------------------------------
 
+def _run_reboot_command(
+    command: list[str],
+    timeout: float,
+) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception as e:
+        log_info(f"reboot command failed to execute {command!r}: {e}")
+        return None
+
+
+def _log_command_failure(
+    label: str,
+    proc: subprocess.CompletedProcess[str] | None,
+) -> None:
+    if proc is None or proc.returncode == 0:
+        return
+
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    detail = stderr if stderr else stdout
+
+    log_info(f"{label} failed rc={proc.returncode}: {detail}")
+
+
 def reboot_system(reason: str) -> int:
     first_request = not REBOOT_REQUESTED_FLAG.exists()
 
@@ -667,40 +700,47 @@ def reboot_system(reason: str) -> int:
                 f"{REBOOT_REQUESTED_FLAG}: {e}"
             )
     else:
-        log_debug("reboot already requested; retrying reboot command")
+        log_debug("reboot already requested; retrying reboot sequence")
 
-    try:
-        proc = subprocess.run(
-            ["/usr/bin/systemctl", "reboot"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+    log_info("requesting orderly reboot through systemd")
 
-        if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
-            stdout = (proc.stdout or "").strip()
-            detail = stderr if stderr else stdout
+    orderly_started = time.monotonic()
+    orderly = _run_reboot_command(
+        ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "reboot"],
+        timeout=ORDERLY_REBOOT_WAIT_SECONDS,
+    )
+    _log_command_failure("orderly reboot request", orderly)
 
-            if first_request:
-                log_info(
-                    f"reboot command failed rc={proc.returncode}: {detail}"
-                )
-            else:
-                log_debug(
-                    f"reboot retry failed rc={proc.returncode}: {detail}"
-                )
+    # If the orderly reboot succeeds, this process disappears as the machine
+    # shuts down. If execution continues, allow a total grace period of 15
+    # seconds from the original request before forcing a kernel-level reboot.
+    elapsed = time.monotonic() - orderly_started
+    remaining = max(0.0, ORDERLY_REBOOT_WAIT_SECONDS - elapsed)
 
-        return proc.returncode
+    if remaining > 0.0:
+        time.sleep(remaining)
 
-    except Exception as e:
-        if first_request:
-            log_info(f"exception while trying to reboot: {e}")
-        else:
-            log_debug(f"exception while retrying reboot: {e}")
+    log_info(
+        f"orderly reboot did not complete within "
+        f"{ORDERLY_REBOOT_WAIT_SECONDS:.0f}s; forcing kernel reboot"
+    )
 
+    sync_proc = _run_reboot_command(
+        ["/usr/bin/sudo", "-n", "/usr/bin/sync"],
+        timeout=15.0,
+    )
+    _log_command_failure("filesystem sync", sync_proc)
+
+    forced = _run_reboot_command(
+        ["/usr/bin/sudo", "-n", "/usr/sbin/reboot", "-f"],
+        timeout=15.0,
+    )
+    _log_command_failure("forced reboot", forced)
+
+    if forced is None:
         return 1
+
+    return forced.returncode
 
 
 # -----------------------------------------------------------------------------
@@ -818,19 +858,7 @@ def process_pending_launches() -> None:
 # Main
 # -----------------------------------------------------------------------------
 
-def main() -> int:
-    log_debug(
-        f"start home_dir={HOME_DIR} runtime_dir={RUNTIME_DIR} "
-        f"flags_dir={FLAGS_DIR} pflags_dir={PFLAGS_DIR} "
-        f"state_file={STATE_FILE}"
-    )
-
-    try:
-        FLAGS_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        log_info(f"failed to create flags dir {FLAGS_DIR}: {e}")
-        return 1
-
+def run_watchdog_cycle() -> int:
     process_pending_launches()
 
     try:
@@ -852,6 +880,48 @@ def main() -> int:
             result = rc
 
     return result
+
+
+def sleep_until_next_check() -> None:
+    now = time.time()
+    next_check = (
+        (int(now // CHECK_INTERVAL_SECONDS) + 1)
+        * CHECK_INTERVAL_SECONDS
+    )
+    delay = max(0.0, next_check - now)
+
+    log_debug(
+        f"next watchdog cycle in {delay:.3f}s at "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_check))}"
+    )
+
+    time.sleep(delay)
+
+
+def main() -> int:
+    log_debug(
+        f"start home_dir={HOME_DIR} runtime_dir={RUNTIME_DIR} "
+        f"flags_dir={FLAGS_DIR} pflags_dir={PFLAGS_DIR} "
+        f"state_file={STATE_FILE} interval={CHECK_INTERVAL_SECONDS:.1f}s"
+    )
+
+    try:
+        FLAGS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log_info(f"failed to create flags dir {FLAGS_DIR}: {e}")
+        return 1
+
+    while True:
+        try:
+            rc = run_watchdog_cycle()
+
+            if rc != 0:
+                log_debug(f"watchdog cycle completed rc={rc}")
+
+        except Exception as e:
+            log_info(f"unhandled exception during watchdog cycle: {e}")
+
+        sleep_until_next_check()
 
 
 if __name__ == "__main__":
